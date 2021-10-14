@@ -1,0 +1,403 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: ECS Fargate template for Cloudformation.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Configuration"
+        Parameters:
+          - VPC
+          - ECSTaskSubnets
+          - ALBSubnets
+          - SecurityGroupRDS
+      - Label:
+          default: "ECS Configuration"
+        Parameters:
+          - ServiceName
+          - ECRImageURI
+          - ECSTaskCPU
+          - ECSTaskMemory
+          - ContainerPort
+          - MinContainers
+          - MaxContainers
+          - ServiceCpuScaleInThreshold
+          - ServiceCpuScaleOutThreshold
+          - ServiceScaleEvaluationPeriods
+      - Label:
+          default: "Load Balancer Configuration"
+        Parameters:
+          - HealthCheckPath
+          - ApplicationWarmUpTime
+
+#Parameters for this template
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+  ECSTaskSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: "Select two private NAT gateway attached subnets for the ECS tasks"
+  ALBSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: "Select two public Internet gateway attached subnets for the load balancer. Make sure the availability zones of these subnets is same as the ones used for ECS tasks"
+  ECRImageURI:
+    Type: String
+    Description: "URI of the docker image saved in AWS ECR. Dont forget to add the tag at the end of it. e.g :latest"
+  ECSTaskCPU:
+    AllowedValues: [512, 1024, 2048, 4096]
+    Type: String
+    Default: 512
+    Description: "Please select CPU capacity for a single task. Default is 256MB."
+  ECSTaskMemory:
+    AllowedValues: [1024, 2048, 4096]
+    Type: String
+    Default: 1024
+    Description: "Please select memory capacity for a single task. Default is 512MB. Make sure that your memory is double the capacity of cpu."
+  ServiceName:
+    Type: String
+    Description: "Provide a name for your ECS Service"
+  ContainerPort:
+    Type: Number
+    Description: "Application port which is exposed in your docker image"
+    Default: 3000
+  SecurityGroupRDS:
+    Type: "AWS::EC2::SecurityGroup::Id"
+    Description: "Provide the groupId of the security group attached to your RDS"
+  HealthCheckPath:
+    Type: String
+    Default: /healthcheck
+    Description: "Provide a valid working path for Load balancer healthchecks in your application. An invalid path will result in termination of your ECS tasks."
+  # For autoscaling
+  ApplicationWarmUpTime:
+    Type: Number
+    Description: "Provide the warm up time for your application during which the ALB health checks would be ignored"
+  ServiceScaleEvaluationPeriods:
+    Description: The number of periods over which data is compared to the specified threshold
+    Type: Number
+    Default: 2
+    MinValue: 2
+  ServiceCpuScaleOutThreshold:
+    Type: Number
+    Description: Average CPU value threshold to trigger auto scaling out
+    Default: 80
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: Value must be between 0 and 100
+  ServiceCpuScaleInThreshold:
+    Type: Number
+    Description: Average CPU value threshold to trigger auto scaling in
+    Default: 25
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: Value must be between 0 and 100
+  MinContainers:
+    Type: Number
+    Default: 1
+    Description: "Minimum number of container you want to be running at all times"
+  MaxContainers:
+    Type: Number
+    Default: 100
+    Description: "Maximum number of containers you want your application to autoscaled to"
+
+#Template Resources
+Resources:
+  #ECS Cluster
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Join ["-", [!Ref ServiceName, Cluster]]
+  #ECS Task Definition Settings
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    # Makes sure the log group is created before it is used.
+    DependsOn: LogGroup
+    Properties:
+      Family: !Join ["-", [!Ref ServiceName, TaskDefinition]]
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref ECSTaskCPU
+      Memory: !Ref ECSTaskMemory
+      ExecutionRoleArn: !Ref ExecutionRole
+      # "The Amazon Resource Name (ARN) of an AWS Identity and Access Management (IAM) role that grants containers in the task permission to call AWS APIs on your behalf."
+      TaskRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions:
+        - Name: !Ref ServiceName
+          Image: !Ref ECRImageURI
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+          # Send logs to CloudWatch Logs
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: ecs
+
+  ECSService:
+    Type: AWS::ECS::Service
+    # This dependency is needed so that the load balancer is setup correctly in time
+    DependsOn:
+      - ListenerHTTP
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: !Ref MinContainers
+      # This may need to be adjusted if the container takes a while to start up
+      HealthCheckGracePeriodSeconds: !Ref ApplicationWarmUpTime
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # change to DISABLED if you're using private subnets that have access to a NAT gateway
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Select [0, !Ref ECSTaskSubnets]
+            - !Select [1, !Ref ECSTaskSubnets]
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+  #A role for the containers to access the other aws services
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ServiceName}-role-ecs-task
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonRDSFullAccess
+        - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+        - arn:aws:iam::325848506085:policy/KMSDecryptPolicy
+
+  #A role needed by ECS
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ["-", [!Ref ServiceName, ExecutionRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+  #Setup Listerner for your load balancer
+  ListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+  #Initialize the load balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      LoadBalancerAttributes:
+        # this is the default, but is specified here in case it needs to be changed
+        - Key: idle_timeout.timeout_seconds
+          Value: 60
+      Name: !Join ["-", [!Ref ServiceName, LoadBalancer]]
+      # "internal" is also an option
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets:
+        - !Select [0, !Ref ALBSubnets]
+        - !Select [1, !Ref ALBSubnets]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 120
+      # will look for a 200 status code by default unless specified otherwise
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckPort: !Ref ContainerPort
+      HealthCheckTimeoutSeconds: 10
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      Name: !Join ["-", [!Ref ServiceName, TargetGroup]]
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 # default is 300
+      TargetType: ip
+      VpcId: !Ref VPC
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription:
+        !Join ["-", [!Ref ServiceName, LoadBalancerSecurityGroup]]
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ["-", [!Ref ServiceName, ContainerSecurityGroup]]
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  AllowECSIntoRDSRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !GetAtt ContainerSecurityGroup.GroupId
+      GroupId: !Ref SecurityGroupRDS
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ["", [/ecs/, !Ref ServiceName, TaskDefinition]]
+
+  ServiceAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Join ["-", [!Ref ServiceName, AutoScalingPolicy]]
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - application-autoscaling:*
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:PutMetricAlarm
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: "*"
+
+  ServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref MinContainers
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Sub
+        - service/${EcsClusterName}/${EcsDefaultServiceName}
+        - EcsClusterName: !Ref Cluster
+          EcsDefaultServiceName: !Ref ServiceName
+      RoleARN: !GetAtt ServiceAutoScalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+    DependsOn:
+      - ECSService
+      - ServiceAutoScalingRole
+
+  ServiceScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join ["-", [!Ref ServiceName, ScaleOutPolicy]]
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 60
+        MetricAggregationType: Average
+        StepAdjustments:
+          - ScalingAdjustment: 1
+            MetricIntervalLowerBound: 0
+    DependsOn: ServiceScalingTarget
+
+  ServiceScaleInPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join ["-", [!Ref ServiceName, ScaleInPolicy]]
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 60
+        MetricAggregationType: Average
+        StepAdjustments:
+          - ScalingAdjustment: -1
+            MetricIntervalUpperBound: 0
+    DependsOn: ServiceScalingTarget
+
+  ServiceScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Join ["-", [!Ref ServiceName, ScaleOutAlarm]]
+      EvaluationPeriods: !Ref ServiceScaleEvaluationPeriods
+      Statistic: Maximum
+      TreatMissingData: notBreaching
+      Threshold: !Ref ServiceCpuScaleOutThreshold
+      AlarmDescription: Alarm to add capacity if CPU is high
+      Period: 60
+      AlarmActions:
+        - !Ref ServiceScaleOutPolicy
+      Namespace: AWS/ECS
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref Cluster
+        - Name: ServiceName
+          Value: !Ref ServiceName
+      ComparisonOperator: GreaterThanThreshold
+      MetricName: CPUUtilization
+    DependsOn:
+      - ECSService
+      - ServiceScaleOutPolicy
+
+  ServiceScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Join ["-", [!Ref ServiceName, ScaleInAlarm]]
+      EvaluationPeriods: !Ref ServiceScaleEvaluationPeriods
+      Statistic: Maximum
+      TreatMissingData: notBreaching
+      Threshold: !Ref ServiceCpuScaleInThreshold
+      AlarmDescription: Alarm to reduce capacity, if container CPU is low
+      Period: 300
+      AlarmActions:
+        - !Ref ServiceScaleInPolicy
+      Namespace: AWS/ECS
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref Cluster
+        - Name: ServiceName
+          Value: !Ref ServiceName
+      ComparisonOperator: LessThanThreshold
+      MetricName: CPUUtilization
+    DependsOn:
+      - ECSService
+      - ServiceScaleInPolicy
+
+Outputs:
+  Endpoint:
+    Description: Endpoint
+    Value: !Join ["", ["https://", !GetAtt LoadBalancer.DNSName]]
